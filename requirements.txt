@@ -1,0 +1,6 @@
+fastapi>=0.115
+uvicorn>=0.32
+akshare>=1.16
+curl_cffi>=0.13
+pandas>=2.2
+numpy>=2.0
