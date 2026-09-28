@@ -38,8 +38,11 @@ def write_site() -> None:
         shutil.copy(STATIC / name, SITE / "static" / name)
     shutil.copy(SITE / "static" / "index.html", SITE / "index.html")
     codes = {row["code"] for row in board.get("right", [])}
+    by_code = {row["code"]: row for row in board.get("right", [])}
     for code in sorted(codes):
-        payload = _scrub(_chart_payload(code))
+        payload = _chart_payload(code)
+        payload["signal"] = by_code.get(code)
+        payload = _scrub(payload)
         (SITE / "charts" / f"{code}.json").write_text(
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
             encoding="utf-8",

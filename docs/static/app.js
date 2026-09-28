@@ -1,5 +1,6 @@
 const state = { board: null, selected: { left: null, right: null }, side: "left" };
 const useApi = location.hostname === "127.0.0.1" || location.hostname === "localhost";
+let cacheBust = "";
 
 function pageBase() {
   let path = location.pathname;
@@ -8,12 +9,16 @@ function pageBase() {
   return path;
 }
 
+function withBust(url) {
+  return cacheBust ? `${url}${url.includes("?") ? "&" : "?"}t=${cacheBust}` : url;
+}
+
 function dashboardUrl() {
-  return useApi ? "/api/dashboard" : `${pageBase()}dashboard.json`;
+  return withBust(useApi ? "/api/dashboard" : `${pageBase()}dashboard.json`);
 }
 
 function chartUrl(code) {
-  return useApi ? `/api/etf/${code}` : `${pageBase()}charts/${code}.json`;
+  return withBust(useApi ? `/api/etf/${code}` : `${pageBase()}charts/${code}.json`);
 }
 const charts = {};
 
@@ -147,6 +152,21 @@ async function pollStatus() {
 }
 
 async function refreshData() {
+  if (!useApi) {
+    $("refresh").disabled = true;
+    $("status-line").textContent = "正在读取已发布的看板…";
+    cacheBust = Date.now().toString();
+    try {
+      await loadDashboard();
+      const code = state.selected[state.side];
+      if (code) await openRow(state.side, code);
+    } catch (err) {
+      $("status-line").textContent = `读取失败 · ${err.message || err}`;
+    } finally {
+      $("refresh").disabled = false;
+    }
+    return;
+  }
   const limit = Number($("limit").value) || 120;
   const minAmount = (Number($("min-amount").value) || 0) * 10000;
   $("refresh").disabled = true;
@@ -158,6 +178,31 @@ async function refreshData() {
   pollStatus();
 }
 
+function rowByCode(code) {
+  return (state.board?.right || []).find((row) => row.code === code) || null;
+}
+
+function syncSheet() {
+  const panel = $(`panel-${state.side}`);
+  const dock = $(`${state.side}-dock`);
+  const open = !!(panel && dock && !panel.hidden && !dock.hidden);
+  document.body.classList.toggle("sheet-open", open);
+}
+
+function closeDock(side) {
+  destroyChart(side);
+  const dock = $(`${side}-dock`);
+  dock.hidden = true;
+  dock.innerHTML = "";
+  state.selected[side] = null;
+  renderTables();
+  syncSheet();
+}
+
+function firstCode(side) {
+  return (listOf(side, "buy")[0] || listOf(side, "sell")[0] || {}).code || null;
+}
+
 function destroyChart(side) {
   if (charts[side]) {
     charts[side].price.remove();
@@ -166,17 +211,29 @@ function destroyChart(side) {
   }
 }
 
+function dockMessage(side, text) {
+  const dock = $(`${side}-dock`);
+  dock.hidden = false;
+  dock.innerHTML = `<p>${text}</p><div class="dock-bar"><button type="button" class="close-dock" data-close="${side}">关闭</button></div>`;
+  syncSheet();
+}
+
 async function openRow(side, code) {
   state.selected[side] = code;
   renderTables();
   const dock = $(`${side}-dock`);
   dock.hidden = false;
-  dock.innerHTML = `<div><p>正在读取 ${code} 的K线和条件对照…</p></div><div></div>`;
+  dock.innerHTML = `<div><p>正在读取 ${code} 的K线和条件对照…</p></div><div class="dock-bar"><button type="button" class="close-dock" data-close="${side}">关闭</button></div>`;
+  syncSheet();
   const res = await fetch(chartUrl(code));
+  if (!res.ok) {
+    dockMessage(side, `没有读到 ${code} 的K线。`);
+    return;
+  }
   const data = await res.json();
-  const signal = data.signal;
+  const signal = data.signal || rowByCode(code);
   if (!signal) {
-    dock.innerHTML = `<p>没有找到 ${code} 的信号。</p>`;
+    dockMessage(side, `没有找到 ${code} 的信号。`);
     return;
   }
   const checks = side === "left" ? signal.checks_left : signal.checks_right;
@@ -187,16 +244,18 @@ async function openRow(side, code) {
     <div>
       <h3>${signal.name}</h3>
       <p>${action}。${detail}</p>
-      <p>${signal.rs_text} ${stop}</p>
+      <p>${signal.rs_text || ""} ${stop}</p>
       <ul class="checks">
-        ${checks.map((item) => `<li><span class="mark ${item.ok ? "" : "no"}">${item.ok ? "是" : "否"}</span><span>${item.text}</span></li>`).join("")}
+        ${(checks || []).map((item) => `<li><span class="mark ${item.ok ? "" : "no"}">${item.ok ? "是" : "否"}</span><span>${item.text}</span></li>`).join("")}
       </ul>
     </div>
     <div>
+      <div class="dock-bar"><button type="button" class="close-dock" data-close="${side}">关闭</button></div>
       <div id="chart-${side}" class="chart"></div>
       <div id="macd-${side}" class="chart-sub"></div>
     </div>`;
   drawChart(side, data);
+  syncSheet();
 }
 
 function drawChart(side, data) {
@@ -210,28 +269,37 @@ function drawChart(side, data) {
     timeScale: { borderColor: "#d5e0e2" },
     crosshair: { mode: 0 },
   };
-  const price = LightweightCharts.createChart(priceEl, { ...base, height: 280 });
+  const price = LightweightCharts.createChart(priceEl, { ...base, autoSize: true });
   const candle = price.addCandlestickSeries({
     upColor: "#ef6a62", downColor: "#3cba8b", borderUpColor: "#ef6a62", borderDownColor: "#3cba8b", wickUpColor: "#ef6a62", wickDownColor: "#3cba8b",
   });
-  candle.setData(data.candles);
+  candle.setData(data.candles || []);
   const ma20 = price.addLineSeries({ color: "#b85a32", lineWidth: 2, priceLineVisible: false });
   const ma60 = price.addLineSeries({ color: "#1d6b73", lineWidth: 1, priceLineVisible: false });
-  ma20.setData(data.ma20);
-  ma60.setData(data.ma60);
-  const macd = LightweightCharts.createChart(macdEl, { ...base, height: 90 });
+  ma20.setData(data.ma20 || []);
+  ma60.setData(data.ma60 || []);
+  const macd = LightweightCharts.createChart(macdEl, { ...base, autoSize: true });
   const hist = macd.addHistogramSeries({ priceLineVisible: false });
-  hist.setData(data.hist.map((item) => ({
+  hist.setData((data.hist || []).map((item) => ({
     time: item.time,
     value: item.value,
     color: item.value >= 0 ? "rgba(239,106,98,0.85)" : "rgba(60,186,139,0.85)",
   })));
-  price.timeScale().fitContent();
-  macd.timeScale().fitContent();
+  const fit = () => {
+    price.timeScale().fitContent();
+    macd.timeScale().fitContent();
+  };
+  fit();
+  requestAnimationFrame(fit);
   charts[side] = { price, macd };
 }
 
 document.body.addEventListener("click", (event) => {
+  const closer = event.target.closest("[data-close]");
+  if (closer) {
+    closeDock(closer.dataset.close);
+    return;
+  }
   const row = event.target.closest("tr[data-code]");
   if (!row) return;
   openRow(row.dataset.side, row.dataset.code);
@@ -250,6 +318,11 @@ function showSide(side) {
     chart.price.timeScale().fitContent();
     chart.macd.timeScale().fitContent();
   }
+  syncSheet();
+  if (state.board?.ready && !state.selected[side]) {
+    const code = firstCode(side);
+    if (code) openRow(side, code);
+  }
 }
 
 ["q-left", "q-right", "hot-left", "hot-right"].forEach((id) => {
@@ -261,10 +334,15 @@ $("tab-right").addEventListener("click", () => showSide("right"));
 ["hold-left", "hold-right"].forEach((id) => $(id).addEventListener("change", saveHolds));
 $("refresh").addEventListener("click", refreshData);
 if (!useApi) {
-  document.querySelectorAll(".controls label, #refresh").forEach((el) => { el.hidden = true; });
+  document.querySelectorAll(".controls label").forEach((el) => { el.hidden = true; });
 }
 loadHolds();
 loadDashboard().then(async () => {
+  if (state.board?.ready && !state.selected[state.side]) {
+    const code = firstCode(state.side);
+    if (code) await openRow(state.side, code);
+  }
+  if (!useApi) return;
   const res = await fetch("/api/status");
   const info = await res.json();
   if (info.running) pollStatus();
