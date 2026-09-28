@@ -2,8 +2,9 @@ name: update-etf-board
 
 on:
   schedule:
-    # 工作日 14:30、16:40 北京时间
+    # 工作日北京时间 14:30、14:45、16:40。14:45 只在 14:30 没成功时补跑。
     - cron: "30 6 * * 1-5"
+    - cron: "45 6 * * 1-5"
     - cron: "40 8 * * 1-5"
   workflow_dispatch:
 
@@ -11,13 +12,47 @@ permissions:
   contents: read
   pages: write
   id-token: write
+  actions: read
 
 concurrency:
   group: pages
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
+  decide:
+    runs-on: ubuntu-latest
+    outputs:
+      refresh: ${{ steps.check.outputs.refresh }}
+    steps:
+      - name: Skip 14:45 when 14:30 already succeeded
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          refresh=true
+          if [ "$EVENT_NAME" = "schedule" ] && [ "$SCHEDULE" = "45 6 * * 1-5" ]; then
+            since="$(date -u -d 'today 06:25' +%Y-%m-%dT%H:%M:%SZ)"
+            count="$(gh run list \
+              --repo "$GITHUB_REPOSITORY" \
+              --workflow pages.yml \
+              --event schedule \
+              --limit 20 \
+              --json databaseId,createdAt,conclusion,status \
+              --jq "[.[] | select(.databaseId != ${RUN_ID} and .createdAt >= \"${since}\" and .conclusion == \"success\" and .status == \"completed\")] | length")"
+            if [ "$count" != "0" ]; then
+              echo "14:30 already succeeded; skip 14:45 fallback"
+              refresh=false
+            fi
+          fi
+          echo "refresh=$refresh" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: decide
+    if: needs.decide.outputs.refresh == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
@@ -28,18 +63,14 @@ jobs:
       - name: Install
         run: pip install -r requirements.txt
       - name: Build static board
-        id: build
-        continue-on-error: true
         run: python -m app.publish
-      - name: Keep the last snapshot if the data source is unreachable
-        if: steps.build.outcome == 'failure'
-        run: git checkout -- site && test -f site/dashboard.json
       - uses: actions/upload-pages-artifact@v3
         with:
           path: site
 
   deploy:
-    needs: build
+    needs: [decide, build]
+    if: needs.decide.outputs.refresh == 'true' && needs.build.result == 'success'
     runs-on: ubuntu-latest
     environment:
       name: github-pages
