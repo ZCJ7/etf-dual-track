@@ -1,0 +1,49 @@
+name: update-etf-board
+
+on:
+  schedule:
+    # 工作日 14:30、16:40 北京时间
+    - cron: "30 6 * * 1-5"
+    - cron: "40 8 * * 1-5"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: pip install -r requirements.txt
+      - name: Build static board
+        id: build
+        continue-on-error: true
+        run: python -m app.publish
+      - name: Keep the last snapshot if the data source is unreachable
+        if: steps.build.outcome == 'failure'
+        run: git checkout -- site && test -f site/dashboard.json
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
