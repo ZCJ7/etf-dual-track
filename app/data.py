@@ -152,6 +152,17 @@ def connect() -> sqlite3.Connection:
         """
     )
     conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS quotes (
+            code TEXT PRIMARY KEY,
+            quoted_on TEXT NOT NULL,
+            price REAL NOT NULL,
+            open REAL, high REAL, low REAL,
+            volume REAL, amount REAL
+        )
+        """
+    )
     return conn
 
 
@@ -269,7 +280,22 @@ def refresh(limit: int = 120, min_amount: float = 20_000_000, categories: list[s
 
         spot = ak.fund_etf_category_sina(symbol="ETF基金")
         universe = select_universe(spot, limit, min_amount, cats)
+        quoted_on = datetime.now(TZ).strftime("%Y-%m-%d")
+        quotes = []
+        for _, item in universe.iterrows():
+            fields = _quote_from_row(item)
+            if fields:
+                quotes.append((str(item["代码"]), fields))
+        try:
+            bench_row = _bench_spot_row()
+            bench_fields = _quote_from_row(bench_row) if bench_row is not None else None
+            if bench_fields:
+                quotes.append((BENCH_CODE, bench_fields))
+        except Exception:
+            pass
         conn = connect()
+        _save_quotes(conn, quoted_on, quotes)
+        conn.commit()
         conn.execute("DELETE FROM instruments")
         conn.executemany(
             "INSERT INTO instruments (code, name, category, amount, pct, price) VALUES (?, ?, ?, ?, ?, ?)",
@@ -320,6 +346,141 @@ def start_refresh(**kwargs) -> bool:
     return True
 
 
+def _positive(value):
+    if value is None or value <= 0:
+        return None
+    return value
+
+
+def _optional_float(value):
+    number = pd.to_numeric(value, errors="coerce")
+    if pd.isna(number):
+        return None
+    return float(number)
+
+
+def _align_volume(volume, history: pd.DataFrame):
+    """新浪列表的成交量有时按手，日线按股。差出两个数量级时换成股。"""
+    if volume is None or volume <= 0 or history.empty or "volume" not in history.columns:
+        return volume
+    recent = pd.to_numeric(history["volume"], errors="coerce").tail(20)
+    recent = recent[recent > 0]
+    if recent.empty:
+        return volume
+    median = float(recent.median())
+    if median <= 0:
+        return volume
+    if volume / median < 0.05 and 0.05 <= (volume * 100) / median <= 20:
+        return volume * 100
+    return volume
+
+
+def apply_quote(bars: pd.DataFrame, quote: dict | None) -> pd.DataFrame:
+    """把更新时刻的价格并进最后一根 K 线，供买卖信号使用。"""
+    if bars is None or bars.empty or not quote:
+        return bars
+    price = quote.get("price")
+    day = quote.get("quoted_on")
+    if price is None or price <= 0 or not day:
+        return bars
+    out = bars.copy()
+    out["date"] = pd.to_datetime(out["date"]).dt.strftime("%Y-%m-%d")
+    last = out["date"].iloc[-1]
+    open_ = quote.get("open") or price
+    high = max(value for value in (quote.get("high"), price, open_) if value)
+    low = min(value for value in (quote.get("low"), price, open_) if value)
+    volume = _align_volume(quote.get("volume"), out)
+    if last == day:
+        idx = out.index[-1]
+        out.loc[idx, "close"] = price
+        out.loc[idx, "high"] = max(float(out.loc[idx, "high"]), high, price)
+        out.loc[idx, "low"] = min(float(out.loc[idx, "low"]), low, price)
+        if volume is not None:
+            out.loc[idx, "volume"] = volume
+        if quote.get("amount") is not None and "amount" in out.columns:
+            out.loc[idx, "amount"] = quote["amount"]
+        return out
+    if last > day or datetime.strptime(day, "%Y-%m-%d").weekday() >= 5:
+        return out
+    if volume is None and pd.notna(out["volume"].iloc[-1]):
+        volume = float(out["volume"].iloc[-1])
+    row = {
+        "date": day,
+        "open": open_,
+        "high": high,
+        "low": low,
+        "close": price,
+        "volume": 0.0 if volume is None else volume,
+    }
+    if "amount" in out.columns:
+        row["amount"] = quote.get("amount")
+    return pd.concat([out, pd.DataFrame([row])], ignore_index=True)
+
+
+def _quote_from_row(row) -> dict | None:
+    def field(*names):
+        for name in names:
+            if name in row.index:
+                value = _optional_float(row[name])
+                if value is not None:
+                    return value
+        return None
+
+    price = field("最新价", "price")
+    if price is None or price <= 0:
+        return None
+    return {
+        "price": price,
+        "open": field("今开", "open"),
+        "high": field("最高", "high"),
+        "low": field("最低", "low"),
+        "volume": _positive(field("成交量", "volume")),
+        "amount": _positive(field("成交额", "amount")),
+    }
+
+
+def _read_quote(conn: sqlite3.Connection, code: str) -> dict | None:
+    row = conn.execute(
+        "SELECT quoted_on, price, open, high, low, volume, amount FROM quotes WHERE code=?",
+        (code,),
+    ).fetchone()
+    if not row or row[1] is None:
+        return None
+    return {
+        "quoted_on": row[0],
+        "price": row[1],
+        "open": row[2],
+        "high": row[3],
+        "low": row[4],
+        "volume": row[5],
+        "amount": row[6],
+    }
+
+
+def _save_quotes(conn: sqlite3.Connection, quoted_on: str, quotes: list[tuple]):
+    conn.execute("DELETE FROM quotes")
+    conn.executemany(
+        """
+        INSERT INTO quotes (code, quoted_on, price, open, high, low, volume, amount)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [(code, quoted_on, item["price"], item["open"], item["high"], item["low"], item["volume"], item["amount"]) for code, item in quotes],
+    )
+
+
+def _bench_spot_row():
+    import akshare as ak
+
+    frame = ak.stock_zh_index_spot_em(symbol="沪深重要指数")
+    if frame is None or frame.empty or "代码" not in frame.columns:
+        return None
+    code = frame["代码"].astype(str).str.replace(r"\D", "", regex=True).str.zfill(6)
+    hit = frame.loc[code == BENCH_CODE]
+    if hit.empty:
+        return None
+    return hit.iloc[0]
+
+
 def load_bars(code: str) -> pd.DataFrame:
     conn = connect()
     df = pd.read_sql_query(
@@ -327,8 +488,9 @@ def load_bars(code: str) -> pd.DataFrame:
         conn,
         params=(code,),
     )
+    quote = _read_quote(conn, code)
     conn.close()
-    return df
+    return apply_quote(df, quote)
 
 
 def load_instruments() -> pd.DataFrame:
