@@ -11,6 +11,10 @@
 - 左侧同时只留 1 只，第一笔 12.5%，之后出现「连续两天绿柱缩短且不创新低」
   再补到 25%。碰到周线 MA20 仍按原来的卖半、全清处理。
 入场仍不要求比价，也不要求 BIAS 门槛。MACD、量能、支撑、周线 MA60 拐头否决保留。
+
+capped=False 时不再限制同时持有几只，也不再把右侧压进 75%、左侧压进 25%。
+每只仍按自己的档位计目标仓位。fit_account=True 时，当天目标加总超过 100% 就同比例缩小到一份资金；
+fit_account=False 时按目标仓位直接加总，总仓位可以超过一份本金。
 """
 
 from __future__ import annotations
@@ -96,7 +100,12 @@ def build_frame(daily: pd.DataFrame) -> pd.DataFrame:
     })
 
 
-def run_proposed(panels: dict[str, pd.DataFrame], master: pd.DatetimeIndex) -> dict:
+def run_proposed(
+    panels: dict[str, pd.DataFrame],
+    master: pd.DatetimeIndex,
+    capped: bool = True,
+    fit_account: bool = True,
+) -> dict:
     codes = list(panels)
     aligned = {}
     for code, frame in panels.items():
@@ -123,6 +132,8 @@ def run_proposed(panels: dict[str, pd.DataFrame], master: pd.DatetimeIndex) -> d
     equity = 1.0
     curve = []
     turnover = 0.0
+    grosses = []
+    name_counts = []
     dates = list(master)
     opens = {c: aligned[c]["open"].to_numpy(float) for c in codes}
 
@@ -216,7 +227,7 @@ def run_proposed(panels: dict[str, pd.DataFrame], master: pd.DatetimeIndex) -> d
             prev_left[code] = int(row["left"])
 
         held_right = [c for c in codes if track[c] == "right"]
-        slots = MAX_RIGHT - len(held_right)
+        slots = len(codes) if not capped else MAX_RIGHT - len(held_right)
         if slots > 0:
             candidates = []
             for code in codes:
@@ -240,9 +251,11 @@ def run_proposed(panels: dict[str, pd.DataFrame], master: pd.DatetimeIndex) -> d
                 book(code, dates[i + 1], price, TIER_UNITS[new_tier], "right", new_tier)
                 prev_div[code] = bool(row["div_w"])
 
-        if not any(track[c] == "left" for c in codes):
-            best = None
-            best_bias = np.inf
+        left_open = any(track[c] == "left" for c in codes)
+        if capped and left_open:
+            pass
+        else:
+            candidates = []
             for code in codes:
                 if track[code] is not None:
                     continue
@@ -252,12 +265,13 @@ def run_proposed(panels: dict[str, pd.DataFrame], master: pd.DatetimeIndex) -> d
                     continue
                 bias = row["bias6"]
                 bias = float(bias) if np.isfinite(bias) else 0.0
-                if bias < best_bias:
-                    best_bias = bias
-                    best = code
-            if best is not None:
-                price = opens[best][i + 1]
-                book(best, dates[i + 1], price, 0.125, "left", 1)
+                candidates.append((bias, code))
+            candidates.sort()
+            if capped:
+                candidates = candidates[:1]
+            for _, code in candidates:
+                price = opens[code][i + 1]
+                book(code, dates[i + 1], price, 0.125, "left", 1)
 
         for code in codes:
             if track[code] == "right":
@@ -266,8 +280,18 @@ def run_proposed(panels: dict[str, pd.DataFrame], master: pd.DatetimeIndex) -> d
                 raw_left[code] = units[code]
         sum_r = sum(raw_right.values())
         sum_l = sum(raw_left.values())
-        scale_r = min(1.0, RIGHT_CAP / sum_r) if sum_r > 0 else 1.0
-        scale_l = min(1.0, LEFT_CAP / sum_l) if sum_l > 0 else 1.0
+        gross = sum_r + sum_l
+        grosses.append(gross)
+        name_counts.append(len(raw_right) + len(raw_left))
+        if capped:
+            scale_r = min(1.0, RIGHT_CAP / sum_r) if sum_r > 0 else 1.0
+            scale_l = min(1.0, LEFT_CAP / sum_l) if sum_l > 0 else 1.0
+        elif fit_account:
+            # 单票仍按三档。加总超过一份资金时同比例缩小，否则一份本金覆盖不了。
+            scale = min(1.0, 1.0 / gross) if gross > 0 else 1.0
+            scale_r = scale_l = scale
+        else:
+            scale_r = scale_l = 1.0
         weights = {c: 0.0 for c in codes}
         for code, value in raw_right.items():
             weights[code] += value * scale_r
@@ -326,6 +350,11 @@ def run_proposed(panels: dict[str, pd.DataFrame], master: pd.DatetimeIndex) -> d
         "avg_exposure": float(np.mean([row[2] for row in curve])),
         "avg_right": float(np.mean([row[3] for row in curve])),
         "avg_left": float(np.mean([row[4] for row in curve])),
+        "avg_gross": float(np.mean(grosses)) if grosses else None,
+        "max_gross": float(np.max(grosses)) if grosses else None,
+        "share_over_one": float(np.mean(np.array(grosses) > 1.0)) if grosses else None,
+        "avg_names": float(np.mean(name_counts)) if name_counts else None,
+        "max_names": int(np.max(name_counts)) if name_counts else 0,
         "right": side_stats("right"),
         "left": side_stats("left"),
         "years": years,
@@ -352,11 +381,15 @@ def main():
         old[item["code"]] = build_pair(daily, bench, False, False)
         proposed[item["code"]] = build_frame(daily)
     loose = run_dual(old, master)
-    fresh = run_proposed(proposed, master)
+    fresh = run_proposed(proposed, master, capped=True)
+    opened = run_proposed(proposed, master, capped=False, fit_account=True)
+    raw = run_proposed(proposed, master, capped=False, fit_account=False)
     report = {
         "benchmark": buy_hold(bench, master),
         "loose": _pack_old(loose, "去掉比价和入场BIAS"),
         "proposed": _pack_old(fresh, "三档补仓+周线出场"),
+        "open_book": _pack_old(opened, "信号全做，超过100%时缩到一份资金"),
+        "open_raw": _pack_old(raw, "信号全做，目标仓位直接加总"),
     }
     path = CACHE / "proposed_report.json"
     path.write_text(json.dumps(report, ensure_ascii=False, default=str, indent=2))
