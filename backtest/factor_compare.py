@@ -231,7 +231,7 @@ def _rolling_div(close: np.ndarray, hist: np.ndarray, split: int) -> np.ndarray:
     return ((now_c > prev_c) & (now_h < prev_h) & (now_h > 0)).fillna(False).to_numpy()
 
 
-def build_signals(daily: pd.DataFrame, bench: pd.DataFrame, ma: int, bias_max: float, use_macd: bool, use_rs: bool) -> pd.DataFrame:
+def build_signals(daily: pd.DataFrame, bench: pd.DataFrame, ma: int, bias_max: float, use_macd: bool, use_rs: bool, use_bias: bool = True) -> pd.DataFrame:
     d = daily.sort_values("date").copy()
     b = bench.sort_values("date")[["date", "close"]].rename(columns={"close": "bench"})
     merged = d.merge(b, on="date", how="left")
@@ -284,11 +284,11 @@ def build_signals(daily: pd.DataFrame, bench: pd.DataFrame, ma: int, bias_max: f
         divergence = np.zeros(len(close), dtype=bool)
         red_shorter = np.zeros(len(close), dtype=bool)
 
-    bias_pullback = bias <= bias_max
+    bias_pullback = (bias <= bias_max) if use_bias else np.ones(len(close), dtype=bool)
     pullback = (low <= ma20 * 1.015) & (close >= ma20 * 0.99)
     breakout = close >= high_20
     volume_ok = np.where(pullback, vol_ratio < 0.8, np.where(breakout, vol_ratio > 1.2, False))
-    timing_ok = bias_pullback & daily_macd_ok
+    timing_ok = (bias_pullback & daily_macd_ok) if use_bias else daily_macd_ok
     valid = np.isfinite(w_ma) & np.isfinite(bias) & np.isfinite(vol_ratio) & np.isfinite(bench_close)
     rs_ok = rs_ok & valid
     trend_ok = trend_ok & valid
@@ -296,7 +296,10 @@ def build_signals(daily: pd.DataFrame, bench: pd.DataFrame, ma: int, bias_max: f
     volume_ok = volume_ok & valid
     score = rs_ok.astype(int) + trend_ok.astype(int) + timing_ok.astype(int) + volume_ok.astype(int)
     buy_ready = (score == 4) & valid
-    heavy = buy_ready & pullback & bias_pullback & (bias >= -3) & ~just_crossed
+    if use_bias:
+        heavy = buy_ready & pullback & bias_pullback & (bias >= -3) & ~just_crossed
+    else:
+        heavy = buy_ready & pullback & ~just_crossed
     weekday = dates.dt.dayofweek.to_numpy()
     broke = (close < ma10) | (close < ma20)
     daily_red_shorter = (hist > 0) & (hist < hist_prev) if use_macd else np.zeros(len(close), dtype=bool)
